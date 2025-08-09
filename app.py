@@ -15,6 +15,9 @@ from dotenv import load_dotenv
 # Load .env when running locally. On Render, environment variables are set in the dashboard.
 load_dotenv()
 
+# Enable INFO level logging for better observability in production logs
+logging.basicConfig(level=logging.INFO)
+
 
 # Environment variables
 SLACK_BOT_TOKEN: Optional[str] = os.getenv("SLACK_BOT_TOKEN")
@@ -22,6 +25,73 @@ SLACK_SIGNING_SECRET: Optional[str] = os.getenv("SLACK_SIGNING_SECRET")
 DIFY_API_KEY: Optional[str] = os.getenv("DIFY_API_KEY")
 DIFY_API_URL: Optional[str] = os.getenv("DIFY_API_URL")  # e.g., https://api.dify.ai/v1/files/upload
 DIFY_USER_ID: Optional[str] = os.getenv("DIFY_USER_ID")  # optional: depending on Dify app settings
+
+
+# --- Safe HTTP logging helpers (redact secrets, summarize payloads) ---
+def _redact_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    safe_headers: Dict[str, str] = dict(headers or {})
+    auth_value = safe_headers.get("Authorization")
+    if isinstance(auth_value, str):
+        # Mask token content while keeping type hint (e.g., "Bearer app-xxxx…")
+        try:
+            parts = auth_value.split()
+            if len(parts) == 2:
+                token_prefix, token_value = parts[0], parts[1]
+                masked = token_value[:10] + "…(redacted)" if len(token_value) > 10 else "…(redacted)"
+                safe_headers["Authorization"] = f"{token_prefix} {masked}"
+            else:
+                safe_headers["Authorization"] = "…(redacted)"
+        except Exception:
+            safe_headers["Authorization"] = "…(redacted)"
+    return safe_headers
+
+
+def _log_http_request(method: str, url: str, *, headers=None, params=None, data=None, files=None) -> None:
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+    size_desc: str = "unknown"
+    try:
+        if files and isinstance(files, dict) and "file" in files:
+            file_field = files["file"]
+            if isinstance(file_field, tuple) and len(file_field) >= 2:
+                filename = file_field[0]
+                file_obj_or_bytes = file_field[1]
+                # file_obj_or_bytes can be bytes or a file-like object
+                try:
+                    if isinstance(file_obj_or_bytes, (bytes, bytearray)):
+                        size_desc = str(len(file_obj_or_bytes))
+                    else:
+                        # Try to get size from file-like object
+                        current_pos = getattr(file_obj_or_bytes, "tell", lambda: None)()
+                        seek = getattr(file_obj_or_bytes, "seek", None)
+                        if seek is not None and current_pos is not None:
+                            seek(0, 2)
+                            end_pos = getattr(file_obj_or_bytes, "tell", lambda: None)()
+                            size_desc = str(end_pos) if end_pos is not None else "unknown"
+                            seek(current_pos, 0)
+                except Exception:
+                    size_desc = "unknown"
+                if len(file_field) >= 3:
+                    mime_type = file_field[2]
+    except Exception:
+        pass
+    logging.info(
+        f"HTTP {method} {url} params={params} headers={_redact_headers(headers)} file=({filename}, {mime_type}, size={size_desc})"
+    )
+
+
+def _log_http_response(resp) -> None:
+    try:
+        body = resp.text
+        if body and len(body) > 500:
+            body = body[:500] + "...(truncated)"
+    except Exception:
+        body = "<non-text body>"
+    try:
+        req = resp.request
+        logging.info(f"HTTP {getattr(req, 'method', 'UNKNOWN')} {getattr(req, 'url', 'UNKNOWN')} -> {resp.status_code} body={body}")
+    except Exception:
+        logging.info(f"HTTP (unknown) -> {resp.status_code} body={body}")
 
 
 # Basic validation
@@ -154,7 +224,14 @@ def fetch_message_by_ts(channel_id: Optional[str], ts: Optional[str]) -> Optiona
         "inclusive": True,
         "limit": 1,
     }
+    _log_http_request(
+        "GET",
+        "https://slack.com/api/conversations.history",
+        headers=headers,
+        params=params,
+    )
     resp = requests.get("https://slack.com/api/conversations.history", headers=headers, params=params, timeout=20)
+    _log_http_response(resp)
     data = resp.json()
     if not data.get("ok"):
         logging.warning(f"conversations.history failed: {data}")
@@ -171,12 +248,19 @@ def download_slack_file(file_id: str) -> tuple[bytes, str, str]:
 
     headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
 
+    _log_http_request(
+        "GET",
+        "https://slack.com/api/files.info",
+        headers=headers,
+        params={"file": file_id},
+    )
     info_resp = requests.get(
         "https://slack.com/api/files.info",
         headers=headers,
         params={"file": file_id},
         timeout=20,
     )
+    _log_http_response(info_resp)
     info = info_resp.json()
     if not info.get("ok"):
         raise RuntimeError(f"files.info failed: {info}")
@@ -189,8 +273,14 @@ def download_slack_file(file_id: str) -> tuple[bytes, str, str]:
     if not download_url:
         raise RuntimeError("url_private_download not available")
 
+    _log_http_request("GET", download_url, headers=headers)
     bin_resp = requests.get(download_url, headers=headers, timeout=60)
     bin_resp.raise_for_status()
+    try:
+        content_len = len(bin_resp.content)
+    except Exception:
+        content_len = "unknown"
+    logging.info(f"HTTP GET {download_url} -> {bin_resp.status_code} content_length={content_len}")
     return bin_resp.content, name, mime_type
 
 
@@ -209,7 +299,15 @@ def upload_to_dify(file_bytes: bytes, filename: str = "image.jpg", mime_type: st
         # Some Dify apps expect a `user` field to associate uploads per end-user
         data["user"] = DIFY_USER_ID
 
+    _log_http_request(
+        "POST",
+        DIFY_API_URL,
+        headers=headers,
+        files=files,
+        data=data,
+    )
     resp = requests.post(DIFY_API_URL, headers=headers, files=files, data=data, timeout=120)
+    _log_http_response(resp)
     try:
         logging.info(f"Dify response: status={resp.status_code} body={resp.text}")
     except Exception:
