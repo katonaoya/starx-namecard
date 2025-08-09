@@ -192,6 +192,7 @@ def handle_app_mention_event(event: Dict[str, Any]) -> None:
     2) Otherwise, fetch the message via conversations.history or replies using channel + ts.
     """
     channel_id: Optional[str] = event.get("channel")
+    slack_user_id: Optional[str] = event.get("user")  # Slackの発言者（ワークフローAPIの user に渡す）
     event_ts: Optional[str] = event.get("ts")
 
     files: List[Dict[str, Any]] = []
@@ -223,7 +224,7 @@ def handle_app_mention_event(event: Dict[str, Any]) -> None:
             logging.info(f"Uploaded to Dify. Status: {status_code}")
             if uploaded_file_id:
                 try:
-                    wf_status = run_workflow_with_uploaded_file(uploaded_file_id)
+                    wf_status = run_workflow_with_uploaded_file(uploaded_file_id, user=slack_user_id)
                     logging.info(f"Workflow run finished. Status: {wf_status}")
                 except Exception as run_e:
                     logging.exception(f"Failed to run workflow for uploaded file {uploaded_file_id}: {run_e}")
@@ -338,7 +339,7 @@ def upload_to_dify(file_bytes: bytes, filename: str = "image.jpg", mime_type: st
     return resp.status_code, uploaded_file_id
 
 
-def run_workflow_with_uploaded_file(file_id: str) -> int:
+def run_workflow_with_uploaded_file(file_id: str, *, user: Optional[str] = None) -> int:
     """Run the Dify workflow by passing uploaded file to start node input `card_images`.
 
     Uses the base URL derived from DIFY_API_URL (upload endpoint) and calls /v1/workflows/run.
@@ -366,6 +367,8 @@ def run_workflow_with_uploaded_file(file_id: str) -> int:
         },
         "response_mode": "blocking",
     }
+    if user:
+        payload["user"] = user
 
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
