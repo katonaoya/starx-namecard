@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
+from urllib.parse import urlparse
 from flask import Flask, request, jsonify, abort
 from dotenv import load_dotenv
 
@@ -24,7 +25,6 @@ SLACK_BOT_TOKEN: Optional[str] = os.getenv("SLACK_BOT_TOKEN")
 SLACK_SIGNING_SECRET: Optional[str] = os.getenv("SLACK_SIGNING_SECRET")
 DIFY_API_KEY: Optional[str] = os.getenv("DIFY_API_KEY")
 DIFY_API_URL: Optional[str] = os.getenv("DIFY_API_URL")  # e.g., https://api.dify.ai/v1/files/upload
-DIFY_USER_ID: Optional[str] = os.getenv("DIFY_USER_ID")  # optional: depending on Dify app settings
 
 
 # --- Safe HTTP logging helpers (redact secrets, summarize payloads) ---
@@ -92,6 +92,19 @@ def _log_http_response(resp) -> None:
         logging.info(f"HTTP {getattr(req, 'method', 'UNKNOWN')} {getattr(req, 'url', 'UNKNOWN')} -> {resp.status_code} body={body}")
     except Exception:
         logging.info(f"HTTP (unknown) -> {resp.status_code} body={body}")
+
+
+def _log_http_request_json(method: str, url: str, *, headers=None, json_body=None) -> None:
+    try:
+        preview = None
+        if json_body is not None:
+            text = str(json_body)
+            preview = text[:800] + "...(truncated)" if len(text) > 800 else text
+    except Exception:
+        preview = "<unprintable>"
+    logging.info(
+        f"HTTP {method} {url} headers={_redact_headers(headers)} json={preview}"
+    )
 
 
 # Basic validation
@@ -206,8 +219,14 @@ def handle_app_mention_event(event: Dict[str, Any]) -> None:
             continue
 
         try:
-            status_code = upload_to_dify(file_bytes, filename=filename, mime_type=mime_type)
+            status_code, uploaded_file_id = upload_to_dify(file_bytes, filename=filename, mime_type=mime_type)
             logging.info(f"Uploaded to Dify. Status: {status_code}")
+            if uploaded_file_id:
+                try:
+                    wf_status = run_workflow_with_uploaded_file(uploaded_file_id)
+                    logging.info(f"Workflow run finished. Status: {wf_status}")
+                except Exception as run_e:
+                    logging.exception(f"Failed to run workflow for uploaded file {uploaded_file_id}: {run_e}")
         except Exception as e:
             logging.exception(f"Failed to upload to Dify for file {file_id}: {e}")
 
@@ -284,7 +303,7 @@ def download_slack_file(file_id: str) -> tuple[bytes, str, str]:
     return bin_resp.content, name, mime_type
 
 
-def upload_to_dify(file_bytes: bytes, filename: str = "image.jpg", mime_type: str = "image/jpeg") -> int:
+def upload_to_dify(file_bytes: bytes, filename: str = "image.jpg", mime_type: str = "image/jpeg") -> tuple[int, Optional[str]]:
     if not (DIFY_API_KEY and DIFY_API_URL):
         raise RuntimeError("DIFY_API_KEY or DIFY_API_URL not configured")
 
@@ -295,9 +314,6 @@ def upload_to_dify(file_bytes: bytes, filename: str = "image.jpg", mime_type: st
         "file": (filename, file_bytes, mime_type),
     }
     data = {}
-    if DIFY_USER_ID:
-        # Some Dify apps expect a `user` field to associate uploads per end-user
-        data["user"] = DIFY_USER_ID
 
     _log_http_request(
         "POST",
@@ -312,6 +328,53 @@ def upload_to_dify(file_bytes: bytes, filename: str = "image.jpg", mime_type: st
         logging.info(f"Dify response: status={resp.status_code} body={resp.text}")
     except Exception:
         pass
+    uploaded_file_id: Optional[str] = None
+    try:
+        body_json = resp.json()
+        if isinstance(body_json, dict):
+            uploaded_file_id = body_json.get("id")
+    except Exception:
+        uploaded_file_id = None
+    return resp.status_code, uploaded_file_id
+
+
+def run_workflow_with_uploaded_file(file_id: str) -> int:
+    """Run the Dify workflow by passing uploaded file to start node input `card_images`.
+
+    Uses the base URL derived from DIFY_API_URL (upload endpoint) and calls /v1/workflows/run.
+    """
+    if not (DIFY_API_KEY and DIFY_API_URL):
+        raise RuntimeError("DIFY_API_KEY or DIFY_API_URL not configured")
+
+    try:
+        parsed = urlparse(DIFY_API_URL)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse DIFY_API_URL: {e}")
+
+    workflows_run_url = f"{base}/v1/workflows/run"
+
+    payload: Dict[str, Any] = {
+        "inputs": {
+            "card_images": [
+                {
+                    "upload_file_id": file_id,
+                    "type": "image",
+                    "transfer_method": "local_file",
+                }
+            ]
+        },
+        "response_mode": "blocking",
+    }
+
+    headers = {
+        "Authorization": f"Bearer {DIFY_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    _log_http_request_json("POST", workflows_run_url, headers=headers, json_body=payload)
+    resp = requests.post(workflows_run_url, headers=headers, json=payload, timeout=120)
+    _log_http_response(resp)
     return resp.status_code
 
 

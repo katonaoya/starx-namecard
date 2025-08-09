@@ -14,7 +14,6 @@ Slackでボット宛のメンションに画像を添付すると、Webhookサ�
 - `SLACK_SIGNING_SECRET`（署名検証用・推奨）
 - `DIFY_API_KEY`
 - `DIFY_API_URL`（例: `https://api.dify.ai/v1/files/upload`）
-- `DIFY_USER_ID`（任意・アプリ要件次第）
 - `PORT`（任意、デフォルト5000）
 
 ローカル開発では `env.example` を参考に `.env` を作成してください。
