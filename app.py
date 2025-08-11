@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
+import re
 
 import requests
 from urllib.parse import urlparse
@@ -195,7 +196,14 @@ def handle_app_mention_event(event: Dict[str, Any]) -> None:
     slack_user_id: Optional[str] = event.get("user")  # Slackの発言者（ワークフローAPIの user に渡す）
     event_ts: Optional[str] = event.get("ts")
 
+    # 画像と一緒に書かれたテキストとメッセージURL（パーマリンク）を取得
+    message_text: Optional[str] = None
+    if isinstance(event.get("text"), str):
+        message_text = strip_mention_from_text(event.get("text"))
+    message_url: Optional[str] = get_message_permalink(channel_id, event_ts)
+
     files: List[Dict[str, Any]] = []
+    message: Optional[Dict[str, Any]] = None
     if isinstance(event.get("files"), list):
         files = event["files"]
     else:
@@ -203,10 +211,31 @@ def handle_app_mention_event(event: Dict[str, Any]) -> None:
         message = fetch_message_by_ts(channel_id, event_ts)
         if message and isinstance(message.get("files"), list):
             files = message["files"]
+        # event側にtextが無く、メッセージ取得できたらtextを補完
+        if message_text is None and message and isinstance(message.get("text"), str):
+            message_text = message.get("text")
+
+    # さらに、ファイルに付随する initial_comment からも本文を補完
+    if not message_text and isinstance(files, list):
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            init_cmt = f.get("initial_comment")
+            if isinstance(init_cmt, dict) and isinstance(init_cmt.get("comment"), str):
+                message_text = init_cmt.get("comment")
+                break
+            if isinstance(init_cmt, str) and init_cmt.strip():
+                message_text = init_cmt.strip()
+                break
 
     if not files:
         logging.info("No files found in the mention event.")
         return
+
+    # 取得できたユーザーID・テキスト・URLをログ化（必要に応じて将来の処理へ受け渡し可能）
+    logging.info(
+        f"Context of mention: user_id={slack_user_id} text={message_text} permalink={message_url}"
+    )
 
     for file_obj in files:
         file_id = file_obj.get("id")
@@ -224,7 +253,13 @@ def handle_app_mention_event(event: Dict[str, Any]) -> None:
             logging.info(f"Uploaded to Dify. Status: {status_code}")
             if uploaded_file_id:
                 try:
-                    wf_status = run_workflow_with_uploaded_file(uploaded_file_id, user=slack_user_id)
+                    wf_status = run_workflow_with_uploaded_file(
+                        uploaded_file_id,
+                        user=slack_user_id,
+                        message_text=message_text,
+                        message_url=message_url,
+                        slack_user_id=slack_user_id,
+                    )
                     logging.info(f"Workflow run finished. Status: {wf_status}")
                 except Exception as run_e:
                     logging.exception(f"Failed to run workflow for uploaded file {uploaded_file_id}: {run_e}")
@@ -339,7 +374,14 @@ def upload_to_dify(file_bytes: bytes, filename: str = "image.jpg", mime_type: st
     return resp.status_code, uploaded_file_id
 
 
-def run_workflow_with_uploaded_file(file_id: str, *, user: Optional[str] = None) -> int:
+def run_workflow_with_uploaded_file(
+    file_id: str,
+    *,
+    user: Optional[str] = None,
+    message_text: Optional[str] = None,
+    message_url: Optional[str] = None,
+    slack_user_id: Optional[str] = None,
+) -> int:
     """Run the Dify workflow by passing uploaded file to start node input `card_images`.
 
     Uses the base URL derived from DIFY_API_URL (upload endpoint) and calls /v1/workflows/run.
@@ -355,16 +397,25 @@ def run_workflow_with_uploaded_file(file_id: str, *, user: Optional[str] = None)
 
     workflows_run_url = f"{base}/v1/workflows/run"
 
+    inputs: Dict[str, Any] = {
+        "card_images": [
+            {
+                "upload_file_id": file_id,
+                "type": "image",
+                "transfer_method": "local_file",
+            }
+        ]
+    }
+    # 追加の文脈情報を同梱（ワークフロー側で受け取る場合は開始ノードに変数を追加してください）
+    if message_text is not None:
+        inputs["message_text"] = message_text
+    if message_url is not None:
+        inputs["message_url"] = message_url
+    if slack_user_id is not None:
+        inputs["slack_user_id"] = slack_user_id
+
     payload: Dict[str, Any] = {
-        "inputs": {
-            "card_images": [
-                {
-                    "upload_file_id": file_id,
-                    "type": "image",
-                    "transfer_method": "local_file",
-                }
-            ]
-        },
+        "inputs": inputs,
         "response_mode": "blocking",
     }
     if user:
@@ -379,6 +430,33 @@ def run_workflow_with_uploaded_file(file_id: str, *, user: Optional[str] = None)
     resp = requests.post(workflows_run_url, headers=headers, json=payload, timeout=120)
     _log_http_response(resp)
     return resp.status_code
+
+
+def get_message_permalink(channel_id: Optional[str], ts: Optional[str]) -> Optional[str]:
+    """SlackのメッセージURLを取得。
+    chat.getPermalink を使用。失敗時は None。
+    """
+    if not SLACK_BOT_TOKEN or not channel_id or not ts:
+        return None
+
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    params = {"channel": channel_id, "message_ts": ts}
+    _log_http_request("GET", "https://slack.com/api/chat.getPermalink", headers=headers, params=params)
+    resp = requests.get("https://slack.com/api/chat.getPermalink", headers=headers, params=params, timeout=20)
+    _log_http_response(resp)
+    data = resp.json()
+    if not data.get("ok"):
+        logging.warning(f"chat.getPermalink failed: {data}")
+        return None
+    return data.get("permalink")
+
+
+def strip_mention_from_text(text: Optional[str]) -> Optional[str]:
+    """テキスト先頭のメンション表記 <@UXXXX> を取り除いて返す。"""
+    if not isinstance(text, str):
+        return text
+    cleaned = re.sub(r"^\s*<@[^>]+>\s*", "", text).strip()
+    return cleaned
 
 
 if __name__ == "__main__":
